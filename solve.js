@@ -184,66 +184,71 @@ function isBlankLine(line) {
 
 function parseFrontMatter(text) {
   if (text !== '---' && !text.startsWith('---\n')) return { error: 'no front matter' };
-  // Find the closing line '---' by scanning lines.
+  // Single pass: parse each front-matter line while scanning for the closing '---',
+  // instead of scanning once to find the close and again to parse. Error semantics
+  // are unchanged: a line error is only reported if the closing line IS found (a
+  // missing close still reports 'the front matter is not closed'), and the first
+  // line error in line order wins.
   let pos = text === '---' ? 3 : 4; // just past the opening line (and its \n)
-  let closeLine = -1; // 1-based line number of the closing '---'
-  let lineNo = 2; // the first front-matter line is line 2
-  let scan = pos;
-  while (scan <= text.length) {
-    const nl = text.indexOf('\n', scan);
+  const data = {};
+  let firstErr = null;
+  let ln = 2; // the first front-matter line is line 2
+  let closeStart = -1;
+  let p = pos;
+  while (p <= text.length) {
+    const nl = text.indexOf('\n', p);
     const end = nl === -1 ? text.length : nl;
-    if (end - scan === 3 && text[scan] === '-' && text[scan + 1] === '-' && text[scan + 2] === '-') {
-      closeLine = lineNo;
+    if (end - p === 3 && text[p] === '-' && text[p + 1] === '-' && text[p + 2] === '-') {
+      closeStart = p;
       break;
     }
-    if (nl === -1) break;
-    scan = nl + 1;
-    lineNo++;
-  }
-  if (closeLine === -1) return { error: 'the front matter is not closed' };
-  const data = {};
-  // Re-scan the front-matter lines (between pos and the closing line) to parse them.
-  let p = pos;
-  let ln = 2;
-  while (ln < closeLine) {
-    const nl = text.indexOf('\n', p);
-    const line = text.slice(p, nl);
-    if (!isBlankLine(line) && line.charCodeAt(0) !== 35) {
-      // '#' comment
-      // key: value — key is [a-z_]+, then ':', then end or ' ' + rest
-      let j = 0;
-      while (j < line.length) {
-        const c = line.charCodeAt(j);
-        if ((c >= 97 && c <= 122) || c === 95) j++;
-        else break;
+    if (firstErr === null) {
+      const line = text.slice(p, end);
+      if (!isBlankLine(line) && line.charCodeAt(0) !== 35) {
+        // '#' comment
+        // key: value — key is [a-z_]+, then ':', then end or ' ' + rest
+        let j = 0;
+        while (j < line.length) {
+          const c = line.charCodeAt(j);
+          if ((c >= 97 && c <= 122) || c === 95) j++;
+          else break;
+        }
+        if (j === 0 || line.charCodeAt(j) !== 58) firstErr = `line ${ln} is not "key: value"`; // ':'
+        else {
+          const key = line.slice(0, j);
+          let raw;
+          if (j + 1 === line.length) raw = '';
+          else if (line.charCodeAt(j + 1) === 32) raw = line.slice(j + 2);
+          else firstErr = `line ${ln} is not "key: value"`;
+          if (firstErr === null) {
+            // drop trailing spaces and tabs
+            let e = raw.length;
+            while (e > 0) {
+              const c = raw.charCodeAt(e - 1);
+              if (c === 32 || c === 9) e--;
+              else break;
+            }
+            raw = raw.slice(0, e);
+            if (!KEYS.includes(key)) firstErr = `unknown key "${key}"`;
+            else if (Object.hasOwn(data, key)) firstErr = `key "${key}" is given twice`;
+            else if (raw === '') firstErr = `key "${key}" has no value`;
+            else {
+              const v = valueOf(key, raw);
+              if ('error' in v) firstErr = v.error;
+              else data[key] = v.value;
+            }
+          }
+        }
       }
-      if (j === 0 || line.charCodeAt(j) !== 58) return { error: `line ${ln} is not "key: value"` }; // ':'
-      const key = line.slice(0, j);
-      let raw;
-      if (j + 1 === line.length) raw = '';
-      else if (line.charCodeAt(j + 1) === 32) raw = line.slice(j + 2);
-      else return { error: `line ${ln} is not "key: value"` };
-      // drop trailing spaces and tabs
-      let e = raw.length;
-      while (e > 0) {
-        const c = raw.charCodeAt(e - 1);
-        if (c === 32 || c === 9) e--;
-        else break;
-      }
-      raw = raw.slice(0, e);
-      if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
-      if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
-      if (raw === '') return { error: `key "${key}" has no value` };
-      const v = valueOf(key, raw);
-      if ('error' in v) return v;
-      data[key] = v.value;
     }
+    if (nl === -1) break;
     p = nl + 1;
     ln++;
   }
+  if (closeStart === -1) return { error: 'the front matter is not closed' };
+  if (firstErr !== null) return { error: firstErr };
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
   // Body: everything after the closing line's newline.
-  const closeStart = p; // start of the closing line
   const closeNl = text.indexOf('\n', closeStart);
   const body = closeNl === -1 ? '' : text.slice(closeNl + 1);
   return { data, body };

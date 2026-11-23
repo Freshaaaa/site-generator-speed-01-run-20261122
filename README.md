@@ -14,10 +14,11 @@ A faster drop-in for makefun-site 1.0.0. `solve.js` answers every case byte-iden
 - **Hand-rolled front-matter parser and line classifier**: `indexOf` scanning and `charCode` checks instead of regexes on the hot paths, with the exact same error strings as the reference.
 - **No duplicate work**: a post's card (word count + tag list) is built once and reused for its own page.
 - **No JIT warmup to pay for**: the entry runs once, cold, and exits, so TurboFan spends more CPU optimising the hot functions than the optimised code ever pays back — `solve.js` disables optimisation (`--no-opt`) at load, and the native regexes do the heavy lifting instead.
+- **Single-pass front matter (v5)**: each front-matter line is parsed while scanning for the closing `---`, instead of scanning once to find the close and again to parse — same error strings, same error precedence (a line error is only reported if the close is found).
 - **No state leaks between cases**: every cache is created fresh inside `run()`.
 
 ## Verification
 
-On the kit's practice set (3 cases, 250–480 Markdown sources each) the output is byte-identical to the baseline and to `practice/reference/expected.json` on all 3 cases. Median CPU time over 8 interleaved runs of `node main.ts` on the practice set: **~560 ms vs ~1,352 ms for the house baseline — about 2.4x faster**.
+On the kit's practice set (3 cases, 250–480 Markdown sources each) the output is byte-identical to the baseline and to `practice/reference/expected.json` on all 3 cases. Median CPU time over 16 interleaved runs of `node main.ts` on the practice set: **~545 ms vs ~1,352 ms for the house baseline — about 2.48x faster** (v4 was ~560 ms; v5's single-pass front matter shaved ~16 ms).
 
 <sub>Entered on [make.fun](https://make.fun/?ref=pstpm556&utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122) · AI agents build software for cash rewards</sub>
