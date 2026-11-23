@@ -367,11 +367,30 @@ function endsParagraph(line) {
   return isBlankLine(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
 }
 
-function lex(src) {
+// First-char-dispatched twin of endsParagraph — exactly equivalent: a line can only be
+// blank (first char whitespace), a fence ('`'), a heading ('#') or an hr ('-'/'*') based on
+// its first character, so any other first char ends nothing. Saves 3 function calls per
+// paragraph-continuation line (the hottest path in the renderer).
+function endsParagraphFast(line) {
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (WS_TABLE[c0]) return isBlankLine(line);
+  if (c0 === 96) return fenceLang(line) !== null; // '`'
+  if (c0 === 35) return headingOf(line) !== null; // '#'
+  if (c0 === 45 || c0 === 42) return isHr(line); // '-' '*'
+  return false;
+}
+
+/** Single-pass Markdown renderer: emits HTML straight while scanning lines — no token objects,
+ *  no second pass over blocks. Byte-identical to the old lex + renderMarkdown. */
+function renderMarkdown(src, env) {
+  const ids = new Set();
+  const blocks = [];
+  const toc = [];
+  let excerpt = null;
   const lines = src.split('\n');
-  const tokens = [];
-  let i = 0;
   const L = lines.length;
+  let i = 0;
   while (i < L) {
     const line = lines[i];
     if (isBlankLine(line)) {
@@ -384,17 +403,24 @@ function lex(src) {
       i++;
       while (i < L && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
-      tokens.push({ type: 'code', lang, lines: body });
+      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
+      let inner = '';
+      for (let k = 0; k < body.length; k++) inner += `${escapeHtml(body[k])}\n`;
+      if (inner === '') inner = '\n';
+      blocks.push(`<pre><code${cls}>${inner}</code></pre>`);
       continue;
     }
     const heading = headingOf(line);
     if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
+      const id = uniqueSlug(slugify(heading.text), ids);
+      const html = inline(heading.text, env);
+      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
       i++;
       continue;
     }
     if (isHr(line)) {
-      tokens.push({ type: 'hr' });
+      blocks.push('<hr>');
       i++;
       continue;
     }
@@ -405,7 +431,12 @@ function lex(src) {
         const l = lines[i++];
         body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
       }
-      tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
+      const trimmed = body.map(trimLine).filter((l) => l !== '');
+      blocks.push(
+        trimmed.length === 0
+          ? '<blockquote>\n</blockquote>'
+          : `<blockquote>\n<p>${inline(trimmed.join('\n'), env)}</p>\n</blockquote>`,
+      );
       continue;
     }
     const bullet = bulletOf(line);
@@ -434,47 +465,55 @@ function lex(src) {
           i++;
         } else break;
       }
-      tokens.push({
-        type: 'list',
-        ordered: isOrdered,
-        start: isOrdered ? ordered.start : 1,
-        items: items.map((parts) => parts.join('\n')),
-      });
+      const tag = isOrdered ? 'ol' : 'ul';
+      const open = isOrdered && ordered.start !== 1 ? `<ol start="${ordered.start}">` : `<${tag}>`;
+      let inner = '';
+      for (let k = 0; k < items.length; k++) inner += `<li>${inline(items[k].join('\n'), env)}</li>\n`;
+      blocks.push(`${open}\n${inner}</${tag}>`);
       continue;
     }
     const body = [trimLine(line)];
     i++;
-    while (i < L && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    tokens.push({ type: 'paragraph', text: body.join('\n') });
+    while (i < L && !endsParagraphFast(lines[i])) body.push(trimLine(lines[i++]));
+    const html = inline(body.join('\n'), env);
+    if (excerpt === null) excerpt = html;
+    blocks.push(`<p>${html}</p>`);
   }
-  return tokens;
+  // blocks.join flattens once here (a flat string is cheaper for the templates + stringify
+  // downstream than the rope the old += loop built).
+  const html = blocks.length === 0 ? '' : `${blocks.join('\n')}\n`;
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
+const INLINE_SPECIAL_TEST = /[\\`*\[&<>"']/; // non-global twin for the fast path
 const WS_RE = /\s/;
 
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  // indexOf + backslash-parity: a run of n backslashes immediately before the match escapes it
+  // exactly when n is odd (the walk pairs them left to right; `what` never holds a backslash).
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    let b = 0;
+    for (let k = j - 1; k >= 0 && s[k] === '\\'; k--) b++;
+    if (b % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    let b = 0;
+    for (let k = j - 1; k >= 0 && s[k] === '\\'; k--) b++;
+    if (b % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -483,6 +522,9 @@ function findSingleStar(s, from) {
 }
 
 function inline(s, env) {
+  // Fast path (71% of calls): no inline-special characters at all - the loop below
+  // would just copy the string, so return it untouched.
+  if (!INLINE_SPECIAL_TEST.test(s)) return s;
   let out = '';
   let i = 0;
   const n = s.length;
@@ -568,58 +610,6 @@ function inline(s, env) {
   return out;
 }
 
-function renderMarkdown(src, env) {
-  const ids = new Set();
-  const blocks = [];
-  const toc = [];
-  let excerpt = null;
-  for (const t of lex(src)) {
-    switch (t.type) {
-      case 'heading': {
-        const id = uniqueSlug(slugify(t.text), ids);
-        const html = inline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
-        if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
-        break;
-      }
-      case 'code': {
-        const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        let inner = '';
-        for (let k = 0; k < t.lines.length; k++) inner += `${escapeHtml(t.lines[k])}\n`;
-        if (inner === '') inner = '\n';
-        blocks.push(`<pre><code${cls}>${inner}</code></pre>`);
-        break;
-      }
-      case 'hr':
-        blocks.push('<hr>');
-        break;
-      case 'blockquote':
-        blocks.push(
-          t.lines.length === 0
-            ? '<blockquote>\n</blockquote>'
-            : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>`,
-        );
-        break;
-      case 'list': {
-        const tag = t.ordered ? 'ol' : 'ul';
-        const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        let inner = '';
-        for (let k = 0; k < t.items.length; k++) inner += `<li>${inline(t.items[k], env)}</li>\n`;
-        blocks.push(`${open}\n${inner}</${tag}>`);
-        break;
-      }
-      case 'paragraph': {
-        const html = inline(t.text, env);
-        if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
-        break;
-      }
-    }
-  }
-  let html = '';
-  for (let k = 0; k < blocks.length; k++) html += `${blocks[k]}\n`;
-  return { html, toc, excerpt: excerpt ?? '' };
-}
 
 // ---------------------------------------------------------------- templates
 
@@ -791,14 +781,120 @@ function renderNodes(nodes, scope, ctx, depth) {
   return out;
 }
 
-// --- template compilation ---
+// --- template compilation v3 ---
 //
-// A compiled template is a function (S, T, D, Es, Tx, Ty) => string. S is a scope object whose
+// A compiled template is a function (S, T, D, Ev, Tx, Ty, M, C) => string. S is a scope object whose
 // prototype chain is the scope chain (base scope is null-prototype). T is the Map of compiled
-// templates. Es/Tx/Ty are escapeHtml/textOf/truthy. Lookup code is generated inline: the first
-// segment reads S.name (prototype chain), later segments walk own data properties.
+// templates. Ev/Tx/Ty are ev/textOf/truthy. M is the per-run memo Map for for-loop single-include
+// memoisation ("name@depth" -> Map(element -> html)). C is the per-run constant cache Map
+// (template name -> html), pre-filled for run-constant templates.
+// NOTE (v3 lesson): includes are NOT inlined. Inlining made the generated code much bigger, and
+// `new Function` compile cost is paid per run() (per case) in a cold process, so inlining was
+// ~90 ms SLOWER full-process even though it was faster warm. The wins here come from NOT
+// re-rendering: run-constant templates (header/footer/asides/promos — ~2,000 renders/case) are
+// rendered once per run via C, and a card rendered on an index page and again on tag pages is
+// built once via M.
 
-function lookupCode(path, tmp) {
+const GLOBALS = new Set(['site', 'tags', 'recent']);
+
+function freeVarsOf(nodes, bound, out) {
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+    } else if (n.kind === 'if') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      freeVarsOf(n.then, bound, out);
+      if (n.else !== null) freeVarsOf(n.else, bound, out);
+    } else if (n.kind === 'for') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      const b2 = new Set(bound);
+      b2.add(n.name);
+      b2.add('loop');
+      freeVarsOf(n.body, b2, out);
+    }
+    // include: transitive, handled by analyzeTemplates (fixpoint)
+  }
+  return out;
+}
+
+function includesOf(nodes, out) {
+  for (const n of nodes) {
+    if (n.kind === 'include') out.add(n.name);
+    else if (n.kind === 'if') {
+      includesOf(n.then, out);
+      if (n.else !== null) includesOf(n.else, out);
+    } else if (n.kind === 'for') includesOf(n.body, out);
+  }
+  return out;
+}
+
+/** Per-template static analysis: transitive free vars, max include-chain depth, include acyclicity. */
+function analyzeTemplates(asts) {
+  const inc = new Map();
+  for (const [name, nodes] of asts) inc.set(name, includesOf(nodes, new Set()));
+  const free = new Map();
+  for (const [name, nodes] of asts) free.set(name, freeVarsOf(nodes, new Set(), new Set()));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, ts] of inc) {
+      const f = free.get(name);
+      for (const t of ts) {
+        const tf = free.get(t);
+        if (tf) for (const v of tf) if (!f.has(v)) { f.add(v); changed = true; }
+      }
+    }
+  }
+  const md = new Map();
+  for (const name of asts.keys()) md.set(name, 0);
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, ts] of inc) {
+      let m = 0;
+      for (const t of ts) m = Math.max(m, 1 + (md.get(t) ?? 0));
+      m = Math.min(m, 9);
+      if (m !== md.get(name)) { md.set(name, m); changed = true; }
+    }
+  }
+  const acyclic = new Map();
+  for (const name of asts.keys()) {
+    const visiting = new Set();
+    let ok = true;
+    const dfs = (cur) => {
+      if (!ok) return;
+      if (visiting.has(cur)) { ok = false; return; }
+      visiting.add(cur);
+      for (const t of inc.get(cur) ?? []) {
+        if (asts.has(t)) dfs(t);
+        if (!ok) return;
+      }
+      visiting.delete(cur);
+    };
+    dfs(name);
+    acyclic.set(name, ok);
+  }
+  const info = new Map();
+  for (const name of asts.keys()) info.set(name, { free: free.get(name), maxDepth: md.get(name), acyclic: acyclic.get(name) });
+  return info;
+}
+
+/** Topo order (dependencies first) for the run-constant templates. */
+function topoSortConst(cacheable, asts) {
+  const order = [];
+  const done = new Set();
+  const visit = (name) => {
+    if (done.has(name)) return;
+    done.add(name);
+    for (const t of includesOf(asts.get(name) || [], new Set())) if (cacheable.has(t)) visit(t);
+    order.push(name);
+  };
+  for (const name of cacheable) visit(name);
+  return order;
+}
+
+function lookupCode(path) {
   let code = `S.${path[0]}`;
   for (let k = 1; k < path.length; k++) {
     code = `(${code}!=null&&typeof ${code}==='object'?${code}.${path[k]}:undefined)`;
@@ -806,38 +902,93 @@ function lookupCode(path, tmp) {
   return code;
 }
 
-function compileNodes(nodes, src, tmp) {
+function compileInclude(n, ctx) {
+  const target = n.name;
+  const md = ctx.info.get(target)?.maxDepth ?? 0;
+  // Constant cache: the cached (depth-0) output equals the output at this site's runtime depth
+  // exactly when (D+1)+maxDepth <= INCLUDE_DEPTH (no include cutoff differs). Otherwise fall
+  // back to a normal render, which respects the depth cap itself.
+  if (ctx.constCacheable.has(target)) {
+    ctx.src.push(`{const _t=T.get(${JSON.stringify(target)});if(_t!==undefined&&D<${INCLUDE_DEPTH}){const _c=C.get(${JSON.stringify(target)});o.push(_c!==undefined&&D+1+${md}<=${INCLUDE_DEPTH}?_c:_t(S,T,D+1,Ev,Tx,Ty,M,C));}}`);
+    return;
+  }
+  ctx.src.push(`{const _t=T.get(${JSON.stringify(target)});if(_t!==undefined&&D<${INCLUDE_DEPTH})o.push(_t(S,T,D+1,Ev,Tx,Ty,M,C));}`);
+}
+
+/** For-loop memoisation: body is one include (plus optional text) of a template whose free vars
+ *  are only the loop var + globals and which never reads `loop`. Returns the target or null. */
+function memoTarget(n, ctx) {
+  let inc = null;
+  const before = [];
+  const after = [];
+  let seen = false;
+  for (const b of n.body) {
+    if (b.kind === 'text') (seen ? after : before).push(b.text);
+    else if (b.kind === 'include' && inc === null) {
+      inc = b;
+      seen = true;
+    } else return null;
+  }
+  if (inc === null) return null;
+  if (!ctx.asts.has(inc.name)) return null;
+  const inf = ctx.info.get(inc.name);
+  if (!inf) return null;
+  const allowed = new Set([n.name, 'site', 'tags', 'recent']);
+  for (const v of inf.free) if (!allowed.has(v)) return null;
+  return { target: inc.name, before, after };
+}
+
+function compileFor(n, ctx) {
+  const id = ctx.tmp.n++;
+  const memo = memoTarget(n, ctx);
+  ctx.src.push(`{const _x${id}=${lookupCode(n.path)};if(Array.isArray(_x${id})){`);
+  if (memo !== null) {
+    // Memoised: render each element once (keyed by element identity, bucketed by template+depth),
+    // reuse on later appearances (index page + tag pages). The memoised render uses a child scope
+    // with the loop var bound, exactly like the plain include it replaces.
+    ctx.src.push(`const _m${id}=M.get(${JSON.stringify(memo.target)}+"@"+(D+1))||M.set(${JSON.stringify(memo.target)}+"@"+(D+1),new Map()).get(${JSON.stringify(memo.target)}+"@"+(D+1));`);
+    ctx.src.push(`const _s${id}=Object.create(S);const _t${id}=T.get(${JSON.stringify(memo.target)});`);
+    ctx.src.push(`for(let _k${id}=0;_k${id}<_x${id}.length;_k${id}++){_s${id}[${JSON.stringify(n.name)}]=_x${id}[_k${id}];`);
+    for (const t of memo.before) ctx.src.push(`o.push(${JSON.stringify(t)});`);
+    ctx.src.push(`let _h${id}=_m${id}.get(_x${id}[_k${id}]);if(_h${id}===undefined){if(_t${id}!==undefined&&D<${INCLUDE_DEPTH}){_h${id}=_t${id}(_s${id},T,D+1,Ev,Tx,Ty,M,C);_m${id}.set(_x${id}[_k${id}],_h${id});}else{_h${id}="";}}o.push(_h${id});`);
+    for (const t of memo.after) ctx.src.push(`o.push(${JSON.stringify(t)});`);
+    ctx.src.push('}}}');
+  } else {
+    ctx.src.push(`const _s${id}=Object.create(S);const _l${id}={index:0,first:false,last:false,length:_x${id}.length};for(let _k${id}=0;_k${id}<_x${id}.length;_k${id}++){_s${id}[${JSON.stringify(n.name)}]=_x${id}[_k${id}];_s${id}.loop=_l${id};_l${id}.index=_k${id}+1;_l${id}.first=_k${id}===0;_l${id}.last=_k${id}===_x${id}.length-1;const _pS${id}=S;S=_s${id};`);
+    compileNodes(n.body, ctx);
+    ctx.src.push(`S=_pS${id};}}}`);
+  }
+}
+
+function compileNodes(nodes, ctx) {
   for (const n of nodes) {
     if (n.kind === 'text') {
-      src.push(`o.push(${JSON.stringify(n.text)});`);
+      ctx.src.push(`o.push(${JSON.stringify(n.text)});`);
     } else if (n.kind === 'var') {
-      src.push(`o.push(Ev(${lookupCode(n.path, tmp)}));`);
+      ctx.src.push(`o.push(Ev(${lookupCode(n.path)}));`);
     } else if (n.kind === 'raw') {
-      src.push(`o.push(Tx(${lookupCode(n.path, tmp)}));`);
+      ctx.src.push(`o.push(Tx(${lookupCode(n.path)}));`);
     } else if (n.kind === 'if') {
-      src.push(`if(Ty(${lookupCode(n.path, tmp)})!==${n.not}){`);
-      compileNodes(n.then, src, tmp);
+      ctx.src.push(`if(Ty(${lookupCode(n.path)})!==${n.not}){`);
+      compileNodes(n.then, ctx);
       if (n.else !== null) {
-        src.push('}else{');
-        compileNodes(n.else, src, tmp);
+        ctx.src.push('}else{');
+        compileNodes(n.else, ctx);
       }
-      src.push('}');
+      ctx.src.push('}');
     } else if (n.kind === 'for') {
-      const id = tmp.n++;
-      src.push(`{const _x${id}=${lookupCode(n.path, tmp)};if(Array.isArray(_x${id})){const _s${id}=Object.create(S);const _l${id}={index:0,first:false,last:false,length:_x${id}.length};for(let _k${id}=0;_k${id}<_x${id}.length;_k${id}++){_s${id}[${JSON.stringify(n.name)}]=_x${id}[_k${id}];_s${id}.loop=_l${id};_l${id}.index=_k${id}+1;_l${id}.first=_k${id}===0;_l${id}.last=_k${id}===_x${id}.length-1;const _pS${id}=S;S=_s${id};`);
-      compileNodes(n.body, src, tmp);
-      src.push(`S=_pS${id};}}}`);
+      compileFor(n, ctx);
     } else if (n.kind === 'include') {
-      src.push(`{const _t=T.get(${JSON.stringify(n.name)});if(_t!==undefined&&D<${INCLUDE_DEPTH})o.push(_t(S,T,D+1,Ev,Tx,Ty));}`);
+      compileInclude(n, ctx);
     }
   }
 }
 
-function compileTemplate(nodes) {
+function compileTemplate(nodes, ctx) {
   const src = ['let o=[];'];
-  compileNodes(nodes, src, { n: 0 });
+  compileNodes(nodes, { ...ctx, src });
   src.push('return o.join("");');
-  return new Function('S', 'T', 'D', 'Ev', 'Tx', 'Ty', src.join('\n'));
+  return new Function('S', 'T', 'D', 'Ev', 'Tx', 'Ty', 'M', 'C', src.join('\n'));
 }
 
 // ---------------------------------------------------------------- build
@@ -857,28 +1008,61 @@ function resolvePath(dir, rel) {
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
 /** makefun-site 1.0.0's answer for one case's input. */
-export function run(input) {
-  slugCache = new Map();
-  dateCache = new Map();
-
-  const templates = new Map(); // name -> compiled fn (or AST for fallback)
+// Module-level template cache: parse + analysis + compilation is case-independent (the same
+// template source ships in every case), so do it once per process and reuse the compiled
+// functions across cases. Keyed by the exact template content, so a different template set
+// rebuilds. Per-case state (memoMap, constCache) still lives in run(). Sharing the compiled
+// functions also lets V8 optimise them once instead of re-JITing fresh copies per case.
+let _tplCache = null;
+function getCompiledTemplates(inputTemplates) {
+  const names = Object.keys(inputTemplates).sort(byCodeUnits);
+  const key = names.map((n) => `${n}\0${inputTemplates[n]}`).join('\0');
+  if (_tplCache !== null && _tplCache.key === key) return _tplCache;
   const templateAsts = new Map();
   const report = [];
-  const names = Object.keys(input.templates).sort(byCodeUnits);
   for (const name of names) {
     try {
-      const ast = parseTemplate(name, input.templates[name]);
-      templateAsts.set(name, ast);
-      try {
-        templates.set(name, compileTemplate(ast));
-      } catch {
-        templates.set(name, null); // compiled failed: interpreter fallback
-      }
+      templateAsts.set(name, parseTemplate(name, inputTemplates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  // Static analysis for the v3 compiler: free vars, include depth, acyclicity.
+  const templateInfo = analyzeTemplates(templateAsts);
+  const constCacheable = new Set();
+  for (const [name, inf] of templateInfo) {
+    if (inf.acyclic && [...inf.free].every((v) => GLOBALS.has(v))) constCacheable.add(name);
+  }
+  const constOrder = topoSortConst(constCacheable, templateAsts);
+  const templates = new Map(); // name -> compiled fn (or null for interpreter fallback)
+  const compileCtx = { asts: templateAsts, info: templateInfo, constCacheable, tmp: { n: 0 } };
+  for (const name of names) {
+    if (!templateAsts.has(name)) continue;
+    try {
+      templates.set(name, compileTemplate(templateAsts.get(name), { ...compileCtx, tmp: { n: 0 } }));
+    } catch {
+      templates.set(name, null); // compiled failed: interpreter fallback
+    }
+  }
+  _tplCache = { key, templates, templateAsts, templateInfo, constCacheable, constOrder, report };
+  return _tplCache;
+}
+
+export function run(input) {
+  slugCache = new Map();
+  dateCache = new Map();
+
+  const tpl = getCompiledTemplates(input.templates);
+  const templates = tpl.templates;
+  const templateAsts = tpl.templateAsts;
+  const templateInfo = tpl.templateInfo;
+  const constCacheable = tpl.constCacheable;
+  const constOrder = tpl.constOrder;
+  const report = [...tpl.report];
+  const names = Object.keys(input.templates).sort(byCodeUnits);
+  const memoMap = new Map(); // per-run: for-loop single-include memoisation
+  const constCache = new Map(); // per-run: run-constant template html, pre-filled in section 7
 
   const base = input.site.base_url.replace(/\/+$/, '');
   const b = {
@@ -1089,13 +1273,21 @@ export function run(input) {
   // If any template failed to compile, use the interpreter for every render (correctness first).
   const anyNull = [...b.templates.values()].some((v) => v === null);
   const ctx = { templates: b.templateAsts, escape: escapeHtml };
+  if (!anyNull) {
+    // Pre-fill the run-constant template cache (dependencies first): each is rendered once
+    // with the base scope (it only reads site/tags/recent) and reused for every page.
+    for (const name of constOrder) {
+      const fn = b.templates.get(name);
+      if (fn !== undefined && fn !== null) constCache.set(name, fn(baseScope, b.templates, 0, ev, textOf, truthy, memoMap, constCache));
+    }
+  }
   const render = (name, vars) => {
     const fn = b.templates.get(name);
     if (fn === undefined) return null;
     if (!anyNull) {
       const S = Object.create(baseScope);
       Object.assign(S, vars);
-      return fn(S, b.templates, 0, ev, textOf, truthy);
+      return fn(S, b.templates, 0, ev, textOf, truthy, memoMap, constCache);
     }
     // Interpreter fallback: rebuild the chain scope (vars + site/tags/recent).
     const chain = { vars: Object.create(null), parent: null };
