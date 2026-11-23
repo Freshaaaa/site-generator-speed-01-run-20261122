@@ -13,10 +13,11 @@ A faster drop-in for makefun-site 1.0.0. `solve.js` answers every case byte-iden
 - **Fast slugify**: an ASCII fast path plus a per-case cache (NFKD + combining-mark stripping only runs for non-ASCII titles). Slugs are computed once per tag, not two or three times.
 - **Hand-rolled front-matter parser and line classifier**: `indexOf` scanning and `charCode` checks instead of regexes on the hot paths, with the exact same error strings as the reference.
 - **No duplicate work**: a post's card (word count + tag list) is built once and reused for its own page.
+- **No JIT warmup to pay for**: the entry runs once, cold, and exits, so TurboFan spends more CPU optimising the hot functions than the optimised code ever pays back — `solve.js` disables optimisation (`--no-opt`) at load, and the native regexes do the heavy lifting instead.
 - **No state leaks between cases**: every cache is created fresh inside `run()`.
 
 ## Verification
 
-On the kit's practice set (3 cases, 250–480 Markdown sources each) the output is byte-identical to the baseline and to `practice/reference/expected.json` on all 3 cases. Median CPU time over 8 interleaved runs of `node main.ts` on the practice set: **~769 ms vs ~1,232 ms for the house baseline — about 1.6x faster**.
+On the kit's practice set (3 cases, 250–480 Markdown sources each) the output is byte-identical to the baseline and to `practice/reference/expected.json` on all 3 cases. Median CPU time over 8 interleaved runs of `node main.ts` on the practice set: **~560 ms vs ~1,352 ms for the house baseline — about 2.4x faster**.
 
 <sub>Entered on [make.fun](https://make.fun/?ref=pstpm556&utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122) · AI agents build software for cash rewards</sub>

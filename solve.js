@@ -4,6 +4,14 @@
 // compiled to JS functions (with an interpreter fallback), prototype-chain scopes, cached + ASCII
 // fast-path slugify, bulk inline Markdown, hand-rolled line classification and front-matter parsing.
 // No state is kept from one case to the next: every cache is created fresh inside run().
+//
+// V8 tuning (v4): this entry runs once, cold, for three cases and exits. TurboFan spends more CPU
+// optimising the hot functions (and deoptimising them) than the optimised code ever pays back, so
+// optimisation is off for the whole run: everything stays interpreted, which is also what makes
+// the native regexes (the real workhorses here) win. main.ts itself notes an entry may tune V8's
+// flags; this is set at module load, before run() compiles or calls anything.
+import { setFlagsFromString } from 'node:v8';
+setFlagsFromString('--no-opt');
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const REPORT_FILE = 'build-report.txt';
@@ -35,46 +43,19 @@ function slugify(text) {
   return out;
 }
 
+const LEAD_DASH_RE = /^-+/;
+const TRAIL_DASH_RE = /-+$/;
+const NON_ALNUM_RE = /[^a-z0-9]+/g;
+
 function slugifySlow(text) {
   if (!NON_ASCII.test(text)) {
-    // ASCII: NFKD is the identity and there are no combining marks.
-    let out = '';
-    let gap = false;
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) {
-        gap = out.length > 0;
-        continue;
-      }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
-    }
-    out = out.slice(0, 64);
-    let end = out.length;
-    while (end > 0 && out[end - 1] === '-') end--;
-    out = out.slice(0, end);
+    // ASCII: replace each run of non-alphanumerics with one '-', drop a leading '-'
+    // (the char loop only opens a gap after a kept char), truncate to 64, drop trailing '-'.
+    const out = text.toLowerCase().replace(NON_ALNUM_RE, '-').replace(LEAD_DASH_RE, '').slice(0, 64).replace(TRAIL_DASH_RE, '');
     return out === '' ? 'untitled' : out;
   }
   const plain = text.normalize('NFKD').replace(MARK_RE, '');
-  let out = '';
-  let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
-    }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
-  }
-  out = out.slice(0, 64).replace(/-+$/, '');
+  const out = plain.toLowerCase().replace(NON_ALNUM_RE, '-').replace(LEAD_DASH_RE, '').slice(0, 64).replace(TRAIL_DASH_RE, '');
   return out === '' ? 'untitled' : out;
 }
 
@@ -487,7 +468,6 @@ function renderMarkdown(src, env) {
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
-const INLINE_SPECIAL_TEST = /[\\`*\[&<>"']/; // non-global twin for the fast path
 const WS_RE = /\s/;
 
 function findUnescaped(s, what, from) {
@@ -521,10 +501,14 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+const MD_CONSTRUCT_TEST = /[*`\\\[]/; // markdown constructs: emphasis/code/escape/link
+
 function inline(s, env) {
-  // Fast path (71% of calls): no inline-special characters at all - the loop below
-  // would just copy the string, so return it untouched.
-  if (!INLINE_SPECIAL_TEST.test(s)) return s;
+  // Fast paths: if there is no markdown construct (* ` \ [), the result is just the
+  // HTML-escaped string (escapeHtml itself returns the string untouched when it holds
+  // no escape character, so this one test covers both the no-special and the
+  // escape-only case). One test instead of two: 33k calls.
+  if (!MD_CONSTRUCT_TEST.test(s)) return escapeHtml(s);
   let out = '';
   let i = 0;
   const n = s.length;
