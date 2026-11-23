@@ -43,19 +43,19 @@ function slugify(text) {
   return out;
 }
 
-const LEAD_DASH_RE = /^-+/;
-const TRAIL_DASH_RE = /-+$/;
 const NON_ALNUM_RE = /[^a-z0-9]+/g;
+const stripLeadDash = (s) => s.charCodeAt(0) === 45 ? s.slice(1) : s;
+const stripTrailDash = (s) => s.charCodeAt(s.length - 1) === 45 ? s.slice(0, -1) : s;
 
 function slugifySlow(text) {
   if (!NON_ASCII.test(text)) {
     // ASCII: replace each run of non-alphanumerics with one '-', drop a leading '-'
     // (the char loop only opens a gap after a kept char), truncate to 64, drop trailing '-'.
-    const out = text.toLowerCase().replace(NON_ALNUM_RE, '-').replace(LEAD_DASH_RE, '').slice(0, 64).replace(TRAIL_DASH_RE, '');
+    const out = stripTrailDash(stripLeadDash(text.toLowerCase().replace(NON_ALNUM_RE, '-')).slice(0, 64));
     return out === '' ? 'untitled' : out;
   }
   const plain = text.normalize('NFKD').replace(MARK_RE, '');
-  const out = plain.toLowerCase().replace(NON_ALNUM_RE, '-').replace(LEAD_DASH_RE, '').slice(0, 64).replace(TRAIL_DASH_RE, '');
+  const out = stripTrailDash(stripLeadDash(plain.toLowerCase().replace(NON_ALNUM_RE, '-')).slice(0, 64));
   return out === '' ? 'untitled' : out;
 }
 
@@ -1218,7 +1218,7 @@ export function run(input) {
           date: s.data.date ?? '',
           date_long: s.data.date === undefined ? '' : longDate(s.data.date),
         };
-  const cardOf = (s) => {
+  const cardOf = (s, needRm) => {
     const tagList = s.tagRefs;
     const tags = new Array(tagList.length);
     for (let k = 0; k < tagList.length; k++) {
@@ -1232,15 +1232,31 @@ export function run(input) {
       date_long: s.data.date === undefined ? '' : longDate(s.data.date),
       summary: s.data.summary ?? '',
       excerpt: s.excerpt,
-      reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+      reading_minutes: needRm ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : undefined,
       tags,
     };
   };
-  for (const p of b.posts) b.cards.set(p, cardOf(p));
+  const rmDirect = new Set();
+  for (const name of names) if (input.templates[name].includes('reading_minutes')) rmDirect.add(name);
+  const incMap = new Map();
+  for (const [name, nodes] of templateAsts) incMap.set(name, includesOf(nodes, new Set()));
+  const incBy = new Map();
+  for (const [name, incs] of incMap) for (const t of incs) {
+    let s = incBy.get(t);
+    if (s === undefined) { s = new Set(); incBy.set(t, s); }
+    s.add(name);
+  }
+  const rmLayouts = new Set(rmDirect);
+  const rmQueue = [...rmDirect];
+  while (rmQueue.length > 0) {
+    const cur = rmQueue.pop();
+    for (const p of incBy.get(cur) ?? []) if (!rmLayouts.has(p)) { rmLayouts.add(p); rmQueue.push(p); }
+  }
+  for (const p of b.posts) b.cards.set(p, cardOf(p, true));
   const pageOf = (s) => {
     // Posts already have a card (for index/tag pages): reuse it instead of rebuilding
     // (word count + tag list) a second time.
-    const base = s.post ? b.cards.get(s) : cardOf(s);
+    const base = s.post ? b.cards.get(s) : cardOf(s, rmLayouts.has(s.layout));
     const c = { ...base };
     c.slug = s.slug;
     c.content = s.html;
