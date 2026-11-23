@@ -18,9 +18,9 @@ const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&
 const ESC_ANY = /[&<>"']/;
 const ESC_ANY_G = /[&<>"']/g;
 
-function escapeHtml(text) {
-  if (!ESC_ANY.test(text)) return text;
-  return text.replace(ESC_ANY_G, (c) => ESCAPES[c]);
+/** Regex replace wins in the real metric: the manual scan built rope strings whose flattening is charged at stringify. */
+function escapeHtml(s) {
+  return ESC_ANY.test(s) ? s.replace(ESC_ANY_G, (c) => ESCAPES[c]) : s;
 }
 
 let slugCache;
@@ -96,16 +96,16 @@ function longDate(date) {
   return out;
 }
 
-/** Word count: runs of non-whitespace, exactly /\S+/g. A tight char loop beats match() (no array). */
+/** Word count: runs of non-whitespace, exactly /\S+/g. Lookup-table whitespace test beats the inline predicate. */
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS_TABLE[c] = 1;
+for (let c = 0x2000; c <= 0x200a; c++) WS_TABLE[c] = 1;
+
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws =
-      c <= 32 || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
-      c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
-    if (ws) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)]) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
@@ -1045,16 +1045,24 @@ export function run(input) {
           date: s.data.date ?? '',
           date_long: s.data.date === undefined ? '' : longDate(s.data.date),
         };
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  const cardOf = (s) => {
+    const tagList = s.tagRefs;
+    const tags = new Array(tagList.length);
+    for (let k = 0; k < tagList.length; k++) {
+      const t = tagList[k];
+      tags[k] = { name: t.name, slug: t.slug, url: t.url };
+    }
+    return {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+      tags,
+    };
+  };
   for (const p of b.posts) b.cards.set(p, cardOf(p));
   const pageOf = (s) => {
     // Posts already have a card (for index/tag pages): reuse it instead of rebuilding
@@ -1063,7 +1071,7 @@ export function run(input) {
     const c = { ...base };
     c.slug = s.slug;
     c.content = s.html;
-    c.toc = s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html }));
+    c.toc = s.toc; // same {level, id, html} entries; templates only read them
     c.newer = linkOf(s.newer ?? null);
     c.older = linkOf(s.older ?? null);
     c.is_post = s.post;
